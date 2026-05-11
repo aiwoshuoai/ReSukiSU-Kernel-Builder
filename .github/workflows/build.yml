@@ -1,0 +1,66 @@
+name: 构建 GKI 6.1 内核 (带 ReSukiSU & AK3 打包)
+
+on:
+  workflow_dispatch: # 支持手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 检出当前仓库代码
+        uses: actions/checkout@v4
+
+      - name: 2. 安装环境依赖与 Repo 工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl python3 zip
+          mkdir -p ~/.bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+          chmod a+rx ~/.bin/repo
+          echo "$HOME/.bin" >> $GITHUB_PATH
+
+      - name: 3. 初始化并同步 GKI 6.1 源码 (耗时操作)
+        run: |
+          mkdir gki_workspace && cd gki_workspace
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          # 拉取 Android 14 对应的 GKI 6.1 源码
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1 --depth=1
+          repo sync -c -j$(nproc) --no-clone-bundle --no-tags
+
+      - name: 4. 注入 ReSukiSU 核心代码
+        run: |
+          cd gki_workspace/common
+          # 使用 ReSukiSU 官方注入脚本
+          curl -LSs "https://raw.githubusercontent.com/aiwoshuoai/ReSukiSU/main/kernel/setup.sh" | bash -
+
+      - name: 5. 开始编译内核 (Kleaf / Bazel)
+        run: |
+          cd gki_workspace
+          # 针对 aarch64 执行编译，使用 thinLTO 提高效率
+          tools/bazel run //common:kernel_aarch64_dist -- --lto=thin
+
+      - name: 6. 准备 AnyKernel3 打包环境
+        run: |
+          # 克隆 AnyKernel3 模板
+          git clone https://github.com/osm0sis/AnyKernel3.git AK3
+          # 清除模板中自带的无用文件
+          rm -rf AK3/.git* AK3/README.md
+          # 将编译生成的 Image 复制到 AK3 目录
+          cp gki_workspace/out_dir/dist/Image AK3/
+          
+          # 修改 anykernel.sh (针对 GKI 设置)
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AK3/anykernel.sh
+          sed -i 's/block=\/dev\/block\/td/block=auto/g' AK3/anykernel.sh
+          sed -i 's/is_slot_device=0/is_slot_device=auto/g' AK3/anykernel.sh
+
+      - name: 7. 生成压缩包并打包
+        run: |
+          cd AK3
+          zip -r9 ../ReSukiSU-GKI-6.1-AK3.zip * -x .git* README.md
+
+      - name: 8. 上传 AK3 刷机包
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReSukiSU-GKI-6.1-Flashable
+          path: ReSukiSU-GKI-6.1-AK3.zip
