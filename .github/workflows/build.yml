@@ -1,66 +1,327 @@
-name: 构建 GKI 6.1 内核 (带 ReSukiSU & AK3 打包)
+name: GKI 6.1 自定义编译
 
 on:
-  workflow_dispatch: # 支持手动触发
+  workflow_dispatch:
+    inputs:
+      compiler_preset:
+        description: '[编译器] 选择预设版本 (若要手填请选 Custom)'
+        required: true
+        default: 'clang-r596125'
+        type: choice
+        options:
+          - clang-r596125
+          - Custom
+
+      compiler_custom:
+        description: '[编译器] (仅选 Custom 时有效) 手填版本号，如 clang-r596125'
+        required: false
+        type: string
+
+      compiler_hash:
+        description: '[编译器] 必须输入上方版本对应的 Commit Hash'
+        required: true
+        default: '1a128578c6d273b8f7bdf027c4340d9874a6861d'
+        type: string
+
+      rekernel_level:
+        description: '[功能注入] Re-Kernel 墓碑冻结机制级别'
+        required: true
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - core
+          - network
+
+      lto_level:
+        description: '[构建选项] LTO 优化级别 (推荐 thin)'
+        required: true
+        default: 'thin'
+        type: choice
+        options:
+          - thin
+          - full
+          - none
+
+      kernel_hz:
+        description: '[性能选项] 选择内核定时器频率 (HZ)'
+        required: true
+        default: '300'
+        type: choice
+        options:
+          - '250'
+          - '300'
+          - '1000'
+
+      make_ak3:
+        description: '[产物输出] 是否自动打包为 AnyKernel3 卡刷包'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  KERNEL_ROOT: "gki_workspace"
+  REKERNEL_LEVEL: ${{ github.event.inputs.rekernel_level }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 检出当前仓库代码
+      - name: 1. 检出当前仓库配置 (Patch 与 Defconfig)
         uses: actions/checkout@v4
 
-      - name: 2. 安装环境依赖与 Repo 工具
+      - name: 2. 解析 UI 参数与环境计算
         run: |
+          if [ "${{ github.event.inputs.compiler_preset }}" == "Custom" ]; then
+            FINAL_CLANG="${{ github.event.inputs.compiler_custom }}"
+          else
+            FINAL_CLANG="${{ github.event.inputs.compiler_preset }}"
+          fi
+          
+          if [ -z "$FINAL_CLANG" ]; then
+            echo "致命错误：你选择了 Custom，但没有填写版本号！"
+            exit 1
+          fi
+          
+          echo "========================================="
+          echo "编译参数最终确认："
+          echo "编译器版本: $FINAL_CLANG"
+          echo "提交哈希值: ${{ github.event.inputs.compiler_hash }}"
+          echo "LTO 级别  : ${{ github.event.inputs.lto_level }}"
+          echo "内核频率  : ${{ github.event.inputs.kernel_hz }} HZ"
+          echo "墓碑级别  : ${{ github.event.inputs.rekernel_level }}"
+          echo "AK3 打包  : ${{ github.event.inputs.make_ak3 }}"
+          echo "========================================="
+          
+          echo "TARGET_CLANG_VER=$FINAL_CLANG" >> $GITHUB_ENV
+          echo "CLANG_COMMIT_HASH=${{ github.event.inputs.compiler_hash }}" >> $GITHUB_ENV
+          echo "LTO_LEVEL=${{ github.event.inputs.lto_level }}" >> $GITHUB_ENV
+          echo "KERNEL_HZ=${{ github.event.inputs.kernel_hz }}" >> $GITHUB_ENV
+          echo "MAKE_AK3=${{ github.event.inputs.make_ak3 }}" >> $GITHUB_ENV
+          
           sudo apt-get update
-          sudo apt-get install -y git curl python3 zip
+          sudo apt-get install -y git curl python3 zip ccache
           mkdir -p ~/.bin
           curl https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
           chmod a+rx ~/.bin/repo
           echo "$HOME/.bin" >> $GITHUB_PATH
 
-      - name: 3. 初始化并同步 GKI 6.1 源码 (耗时操作)
+      - name: 3. 设置缓存提速 (Clang & Bazel)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.clang_cache
+            ~/.cache/bazel
+          key: gki-cache-${{ env.TARGET_CLANG_VER }}-${{ github.sha }}
+          restore-keys: |
+            gki-cache-${{ env.TARGET_CLANG_VER }}-
+            gki-cache-
+
+      - name: 4. 初始化并同步 GKI 6.1 源码 (耗时较长)
         run: |
-          mkdir gki_workspace && cd gki_workspace
+          mkdir -p ${{ env.KERNEL_ROOT }} && cd ${{ env.KERNEL_ROOT }}
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
-          # 拉取 Android 14 对应的 GKI 6.1 源码
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1 --depth=1
           repo sync -c -j$(nproc) --no-clone-bundle --no-tags
 
-      - name: 4. 注入 ReSukiSU 核心代码
+      - name: 5. 跨版本精准拉取与替换编译器
         run: |
-          cd gki_workspace/common
-          # 使用 ReSukiSU 官方注入脚本
+          cd ${{ env.KERNEL_ROOT }}
+          DEFAULT_CLANG_DIR=$(ls -d prebuilts/clang/host/linux-x86/clang-r* | head -n 1)
+          
+          CACHE_DIR="$HOME/.clang_cache"
+          mkdir -p "$CACHE_DIR"
+          TAR_PATH="$CACHE_DIR/${{ env.TARGET_CLANG_VER }}.tar.gz"
+          
+          if [ ! -f "$TAR_PATH" ]; then
+            echo "未命中缓存，启动绝对坐标检出..."
+            mkdir -p /tmp/clang_pull && cd /tmp/clang_pull
+            git init
+            git remote add origin https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+            git config core.sparseCheckout true
+            echo "${{ env.TARGET_CLANG_VER }}/*" >> .git/info/sparse-checkout
+          
+            echo "正在连接 Google 服务器验证 Hash..."
+            git fetch --depth 1 origin ${{ env.CLANG_COMMIT_HASH }}
+            git checkout FETCH_HEAD
+          
+            if [ ! -d "${{ env.TARGET_CLANG_VER }}" ]; then
+               echo "致命错误：下载失败！你输入的 Hash [${{ env.CLANG_COMMIT_HASH }}] 内部存在 [${{ env.TARGET_CLANG_VER }}] 文件夹！"
+               exit 1
+            fi
+          
+            tar -czf "$TAR_PATH" "${{ env.TARGET_CLANG_VER }}"
+            cd -
+          else
+            echo "命中缓存，直接解压编译器压缩包！"
+          fi
+          
+          mkdir -p /tmp/new_clang && cd /tmp/new_clang
+          tar -xzf "$TAR_PATH"
+          
+          cd $GITHUB_WORKSPACE/${{ env.KERNEL_ROOT }}
+          mv "$DEFAULT_CLANG_DIR" "${DEFAULT_CLANG_DIR}_bak"
+          mv "/tmp/new_clang/${{ env.TARGET_CLANG_VER }}" "$DEFAULT_CLANG_DIR"
+          
+          echo "正在继承旧版本 Bazel 通行证 (BUILD.bazel)..."
+          cp "${DEFAULT_CLANG_DIR}_bak/BUILD.bazel" "$DEFAULT_CLANG_DIR/BUILD.bazel" || true
+          echo "编译器替换完成！"
+          
+          echo "验证 LLVM 工具链版本："
+          "$DEFAULT_CLANG_DIR/bin/ld.lld" --version
+          "$DEFAULT_CLANG_DIR/bin/llvm-ar" --version
+          "$DEFAULT_CLANG_DIR/bin/llvm-objdump" --version
+
+      - name: 6. 应用内核源码补丁 (Patch)
+        run: |
+          cd ${{ env.KERNEL_ROOT }}/common
+          echo "正在扫描并应用补丁..."
+          for p in $GITHUB_WORKSPACE/Patch/*.patch; do
+            if [ -f "$p" ]; then
+              echo "成功打入补丁: $(basename $p)"
+              patch -p1 < "$p"
+            fi
+          done
+
+      - name: 7. 动态注入内核配置 (Defconfig & HZ)
+        run: |
+          cd ${{ env.KERNEL_ROOT }}/common
+          echo "正在注入静态配置..."
+          cat $GITHUB_WORKSPACE/config/gki_defconfig >> arch/arm64/configs/gki_defconfig
+          
+          echo "正在锁定内核频率为: ${{ env.KERNEL_HZ }} HZ..."
+          scripts/config --file arch/arm64/configs/gki_defconfig -d CONFIG_HZ_100 -d CONFIG_HZ_250 -d CONFIG_HZ_300 -d CONFIG_HZ_1000
+          scripts/config --file arch/arm64/configs/gki_defconfig -e CONFIG_HZ_${{ env.KERNEL_HZ }}
+          scripts/config --file arch/arm64/configs/gki_defconfig --set-val CONFIG_HZ ${{ env.KERNEL_HZ }}
+
+      - name: 8. 注入 ReSukiSU 核心驱动
+        run: |
+          cd ${{ env.KERNEL_ROOT }}/common
           curl -LSs "https://raw.githubusercontent.com/aiwoshuoai/ReSukiSU/main/kernel/setup.sh" | bash -
 
-      - name: 5. 开始编译内核 (Kleaf / Bazel)
+      - name: 9. 注入 Re-Kernel (墓碑冻结机制)
+        if: ${{ env.REKERNEL_LEVEL != 'none' }}
         run: |
-          cd gki_workspace
-          # 针对 aarch64 执行编译，使用 thinLTO 提高效率
-          tools/bazel run //common:kernel_aarch64_dist -- --lto=thin
-
-      - name: 6. 准备 AnyKernel3 打包环境
-        run: |
-          # 克隆 AnyKernel3 模板
-          git clone https://github.com/osm0sis/AnyKernel3.git AK3
-          # 清除模板中自带的无用文件
-          rm -rf AK3/.git* AK3/README.md
-          # 将编译生成的 Image 复制到 AK3 目录
-          cp gki_workspace/out_dir/dist/Image AK3/
+          cd ${{ env.KERNEL_ROOT }}
+          echo "开始集成 Re-Kernel..."
+          TMP_REKERNEL=/tmp/rekernel
+          rm -rf "$TMP_REKERNEL"
+          git clone --depth 1 https://github.com/Sakion-Team/Re-Kernel.git "$TMP_REKERNEL"
           
-          # 修改 anykernel.sh (针对 GKI 设置)
+          # 准备驱动源码
+          mkdir -p common/drivers/rekernel
+          cp "$TMP_REKERNEL/LKM-Source/rekernel.c" common/drivers/rekernel/
+          cp "$TMP_REKERNEL/LKM-Source/rekernel.h" common/drivers/rekernel/
+
+          # 生成构建配置
+          cat > common/drivers/rekernel/Kconfig << 'EOF'
+          menu "Re:Kernel"
+          config REKERNEL
+              bool "Re:Kernel support (GKI Vendor Hooks)"
+              default y
+          config REKERNEL_NETWORK
+              bool "Re:Kernel NetReceive unfreeze support"
+              depends on REKERNEL
+              default n
+          endmenu
+          EOF
+
+          cat > common/drivers/rekernel/Makefile << 'EOF'
+          obj-$(CONFIG_REKERNEL) += rekernel.o
+          ccflags-$(CONFIG_REKERNEL_NETWORK) += -DNETWORK_FILTER
+          EOF
+
+          # 挂载到驱动树
+          if ! grep -qF 'source "drivers/rekernel/Kconfig"' common/drivers/Kconfig; then
+            sed -i '/^endmenu$/i source "drivers/rekernel/Kconfig"' common/drivers/Kconfig
+          fi
+          if ! grep -qF 'obj-$(CONFIG_REKERNEL) += rekernel/' common/drivers/Makefile; then
+            echo 'obj-$(CONFIG_REKERNEL) += rekernel/' >> common/drivers/Makefile
+          fi
+
+          # 启用内核版本宏 (锁定 6.1)
+          REKERNEL_H="common/drivers/rekernel/rekernel.h"
+          if grep -q "^// #define KERNEL_6_1$" "$REKERNEL_H"; then
+            sed -i "s|^// #define KERNEL_6_1$|#define KERNEL_6_1|" "$REKERNEL_H"
+          fi
+
+          # 修正头文件包含路径
+          sed -i 's|#include <../android/binder_internal.h>|#include "../../drivers/android/binder_internal.h"|g' common/drivers/rekernel/rekernel.c
+          grep -qF '#include <linux/seq_file.h>' common/drivers/rekernel/rekernel.c || sed -i '/#include <trace\/hooks\/signal.h>/a #include <linux/seq_file.h>' common/drivers/rekernel/rekernel.c
+
+          # 动态修改 Defconfig
+          DEFCONFIG="common/arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_REKERNEL=y" >> "$DEFCONFIG"
+          if [ "${{ env.REKERNEL_LEVEL }}" == "network" ]; then
+            echo "CONFIG_REKERNEL_NETWORK=y" >> "$DEFCONFIG"
+          fi    
+
+      - name: 10. 执行 GKI 编译构建 (Kleaf/Bazel)
+        run: |
+          cd ${{ env.KERNEL_ROOT }}
+          BAZEL_FLAGS="--config=fast --disk_cache=~/.cache/bazel"
+          if [ "${{ env.LTO_LEVEL }}" != "none" ]; then
+            BAZEL_FLAGS="$BAZEL_FLAGS --lto=${{ env.LTO_LEVEL }}"
+          fi
+          tools/bazel build $BAZEL_FLAGS //common:kernel_aarch64_dist
+
+      - name: 11. AnyKernel3 自动化打包
+        if: ${{ env.MAKE_AK3 == 'true' }}
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3.git AK3
+          rm -rf AK3/.git*
+          cp ${{ env.KERNEL_ROOT }}/out/kernel_aarch64/dist/Image AK3/
           sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AK3/anykernel.sh
           sed -i 's/block=\/dev\/block\/td/block=auto/g' AK3/anykernel.sh
           sed -i 's/is_slot_device=0/is_slot_device=auto/g' AK3/anykernel.sh
+          cd AK3 && zip -r9 ../ReSukiSU-GKI-6.1-Flashable.zip *
 
-      - name: 7. 生成压缩包并打包
-        run: |
-          cd AK3
-          zip -r9 ../ReSukiSU-GKI-6.1-AK3.zip * -x .git* README.md
-
-      - name: 8. 上传 AK3 刷机包
+      - name: 12. 上传最终产物 (AK3 刷机包)
+        if: ${{ env.MAKE_AK3 == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ReSukiSU-GKI-6.1-Flashable
-          path: ReSukiSU-GKI-6.1-AK3.zip
+          name: ReSukiSU-GKI-6.1-[${{ env.TARGET_CLANG_VER }}]-AK3
+          path: ReSukiSU-GKI-6.1-Flashable.zip
+
+      - name: 13. 上传最终产物 (纯 Image 镜像)
+        if: ${{ env.MAKE_AK3 == 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReSukiSU-GKI-6.1-[${{ env.TARGET_CLANG_VER }}]-Image
+          path: ${{ env.KERNEL_ROOT }}/out/kernel_aarch64/dist/Image
+
+      - name: 14. 收集补丁冲突文件
+        if: always()
+        run: |
+          if [ ! -d "${{ env.KERNEL_ROOT }}" ]; then
+            echo "源码目录未就绪，无需收集补丁冲突。"
+            echo "REJ_COUNT=0" >> $GITHUB_ENV
+            exit 0
+          fi
+          REJECTS_DIR="$GITHUB_WORKSPACE/patch-rejects"
+          mkdir -p "$REJECTS_DIR"
+          cd $GITHUB_WORKSPACE
+          mapfile -t REJS < <(find "${{ env.KERNEL_ROOT }}" -type f -name '*.rej' 2>/dev/null || true)
+          REJ_COUNT=${#REJS[@]}
+          echo "REJ_COUNT=$REJ_COUNT" >> $GITHUB_ENV
+          if [ "$REJ_COUNT" -gt 0 ]; then
+            for REJ in "${REJS[@]}"; do
+              REL="${REJ#$KERNEL_ROOT/}"
+              DEST="$REJECTS_DIR/$REL"
+              mkdir -p "$(dirname "$DEST")"
+              cp "$REJ" "$DEST"
+              ORIG="${REJ%.rej}"
+              [ -f "$ORIG" ] && cp "$ORIG" "${DEST%.rej}"
+              echo "$REL" >> "$REJECTS_DIR/index.txt"
+            done
+          fi
+
+      - name: 15. 上传补丁冲突文件
+        if: always() && env.REJ_COUNT != '0' && env.REJ_COUNT != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReSukiSU-GKI-6.1-[${{ env.TARGET_CLANG_VER }}]-Rejects
+          path: patch-rejects/
+          if-no-files-found: ignore
+          compression-level: 9
